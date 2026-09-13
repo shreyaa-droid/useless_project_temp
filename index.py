@@ -1,0 +1,664 @@
+import os
+import time
+import math
+import random
+import cv2
+import PIL.Image
+import PIL.ImageTk
+import numpy as np
+import pygame
+import tkinter as tk
+from PIL import Image, ImageTk
+
+# Optional imports based on your setup
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
+
+# =========================================================
+# GLOBAL CONSTANTS & PATH SETUP
+# =========================================================
+
+# Dynamically target the 'ann' folder on your Desktop
+BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "ann")
+
+YELLOW = "#f39c12"
+RED = "#e74c3c"
+GREEN = "#2ecc71"
+DARK_BG = "#1e1e2f"
+
+# BGR versions of GREEN/RED for drawing directly on OpenCV frames
+GOOD_COLOR_BGR = (113, 204, 46)   # matches GREEN "#2ecc71"
+BAD_COLOR_BGR = (60, 76, 231)     # matches RED "#e74c3c"
+
+# Posture thresholds in degrees. Tune these once you can see the live
+# angle readout on screen -- ideal values depend on your camera height/
+# distance and your own natural resting posture.
+NECK_ANGLE_THRESHOLD = 30
+TORSO_ANGLE_THRESHOLD = 15
+
+# Pygame Audio Initialization
+pygame.mixer.init()
+
+frame_counter = 0
+last_yolo_frame = 0
+phone_detected = False
+phone_box = None  # (x1, y1, x2, y2) of the last detected phone, for drawing
+
+# Web Camera Capture Initialization
+cap = cv2.VideoCapture(0)
+
+# ---------------------------------------------------------
+# Phone detection via YOLOv8 (ultralytics)
+# ---------------------------------------------------------
+# "cell phone" is a standard COCO object class (id 67), so a stock
+# pretrained YOLOv8-nano model can spot it with no custom training.
+# The model file (~6MB) auto-downloads the first time this runs.
+PHONE_CLASS_ID = 67
+yolo_model = None
+try:
+    from ultralytics import YOLO
+    yolo_model = YOLO("yolov8n.pt")
+    print("[INFO] Phone detection enabled (YOLOv8n).")
+except Exception as e:
+    print(f"[WARNING] Phone detection disabled - could not load YOLO model: {e}")
+    print("[WARNING] Run: pip install ultralytics")
+
+# MediaPipe Pose setup
+#
+# Newer MediaPipe wheels (especially on newer Python versions) sometimes
+# ship WITHOUT the old "mp.solutions.pose" API, only the newer Tasks API
+# (mp.tasks.vision.PoseLandmarker). Both use the same 33-point BlazePose
+# skeleton with the same landmark index numbering, so we detect whichever
+# API is available and normalize both to a plain indexable landmark list
+# in detect_pose() below.
+POSE_BACKEND = None   # "legacy", "tasks", or None
+pose_detector = None       # legacy mp.solutions.pose.Pose instance
+pose_landmarker = None     # tasks-API PoseLandmarker instance
+_pose_start_time = None    # for building increasing timestamps the Tasks API requires
+
+# BlazePose landmark indices (same numbering in both APIs)
+LM_LEFT_SHOULDER, LM_RIGHT_SHOULDER = 11, 12
+LM_LEFT_EAR, LM_RIGHT_EAR = 7, 8
+LM_LEFT_HIP, LM_RIGHT_HIP = 23, 24
+
+# A basic set of body connections for drawing the skeleton manually with
+# OpenCV -- this avoids depending on mp.solutions.drawing_utils, which
+# isn't available when only the Tasks API ships.
+POSE_CONNECTIONS_BASIC = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24),
+    (23, 25), (25, 27), (24, 26), (26, 28),
+    (27, 29), (29, 31), (27, 31),
+    (28, 30), (30, 32), (28, 32),
+    (7, 11), (8, 12),  # ear-to-shoulder "neck" lines
+]
+POSE_JOINTS_BASIC = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 7, 8]
+
+
+def _ensure_pose_task_model():
+    """Downloads the small MediaPipe Tasks pose model file once, if needed,
+    and returns its local path (or None if that fails, e.g. no internet)."""
+    model_path = os.path.join(BASE_DIR, "pose_landmarker_lite.task")
+    if os.path.exists(model_path):
+        return model_path
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        import urllib.request
+        url = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+               "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task")
+        print("[SETUP] Downloading MediaPipe pose model (one-time, ~5MB)...")
+        urllib.request.urlretrieve(url, model_path)
+        print(f"[SETUP] Pose model saved to {model_path}")
+        return model_path
+    except Exception as e:
+        print(f"[SETUP ERROR] Could not download MediaPipe Tasks pose model: {e}")
+        return None
+
+
+try:
+    import mediapipe as mp
+    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'pose'):
+        # --- Old/legacy API is available ---
+        _mp_pose_module = mp.solutions.pose
+        pose_detector = _mp_pose_module.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        POSE_BACKEND = "legacy"
+        print("[INFO] Using MediaPipe legacy Pose solution (mp.solutions.pose).")
+    else:
+        # --- Fall back to the newer Tasks API ---
+        from mediapipe.tasks import python as mp_tasks_python
+        from mediapipe.tasks.python import vision as mp_vision
+
+        model_path = _ensure_pose_task_model()
+        if model_path:
+            base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
+            options = mp_vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                running_mode=mp_vision.RunningMode.VIDEO,
+                num_poses=1,
+            )
+            pose_landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+            POSE_BACKEND = "tasks"
+            _pose_start_time = time.time()
+            print("[INFO] Using MediaPipe Tasks PoseLandmarker (new API).")
+        else:
+            print("[WARNING] Could not set up MediaPipe Tasks pose model. "
+                  "Posture detection will be disabled until this is resolved.")
+except Exception as e:
+    print(f"[WARNING] MediaPipe pose initialization failed: {e}")
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+
+def play_audio(file_path):
+    """Plays audio via pygame if file exists."""
+    if os.path.exists(file_path):
+        try:
+            pygame.mixer.music.load(file_path)
+            pygame.mixer.music.play()
+        except Exception as e:
+            print(f"[AUDIO ERROR] Could not play {file_path}: {e}")
+    else:
+        print(f"[AUDIO MISSING] File not found: {file_path}")
+
+def stop_audio():
+    """Stops pygame audio playback."""
+    if pygame.mixer.music.get_busy():
+        pygame.mixer.music.stop()
+
+def audio_is_playing():
+    """Checks if audio is currently playing."""
+    return pygame.mixer.music.get_busy()
+
+def detect_phone(frame):
+    """Runs a YOLOv8 pass looking specifically for a cell phone in frame.
+    Updates the global phone_detected flag and phone_box (for drawing)."""
+    global phone_detected, phone_box
+    phone_detected = False
+    phone_box = None
+
+    if yolo_model is None:
+        return
+
+    try:
+        results = yolo_model.predict(
+            source=frame, conf=0.45, classes=[PHONE_CLASS_ID], verbose=False
+        )
+    except Exception as e:
+        print(f"[PHONE DETECT ERROR] {e}")
+        return
+
+    if results and len(results[0].boxes) > 0:
+        phone_detected = True
+        box = results[0].boxes[0]
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        phone_box = (x1, y1, x2, y2)
+
+def find_angle(x1, y1, x2, y2):
+    """Angle in degrees between the segment (x1,y1)-(x2,y2) and the
+    vertical line passing through (x1,y1). Used to measure how far the
+    neck/torso is leaning forward relative to straight-up."""
+    try:
+        theta = math.acos(
+            (y2 - y1) * (-y1) /
+            (math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) * y1)
+        )
+    except (ValueError, ZeroDivisionError):
+        return 0
+    return int(180 / math.pi * theta)
+
+def _draw_skeleton(frame, landmarks, w, h, color):
+    """Manually draws the skeleton with OpenCV so it works identically
+    regardless of which MediaPipe API produced the landmarks."""
+    for idx in POSE_JOINTS_BASIC:
+        p = landmarks[idx]
+        cv2.circle(frame, (int(p.x * w), int(p.y * h)), 4, color, -1)
+    for a, b in POSE_CONNECTIONS_BASIC:
+        pa, pb = landmarks[a], landmarks[b]
+        cv2.line(frame, (int(pa.x * w), int(pa.y * h)),
+                  (int(pb.x * w), int(pb.y * h)), color, 2)
+
+
+def detect_pose(frame):
+    """Runs MediaPipe pose estimation (legacy solutions API or the newer
+    Tasks API, whichever is available), draws a green/red skeleton overlay
+    on the frame, and returns whether the person is currently slouching."""
+    if POSE_BACKEND is None:
+        cv2.putText(frame, "MediaPipe pose detection not available",
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        return frame, False
+
+    h, w = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    landmarks = None  # normalized to a plain indexable list of x/y/visibility
+
+    if POSE_BACKEND == "legacy":
+        rgb.flags.writeable = False
+        results = pose_detector.process(rgb)
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+    else:  # "tasks"
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = int((time.time() - _pose_start_time) * 1000)
+        result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+        if result.pose_landmarks:
+            landmarks = result.pose_landmarks[0]
+
+    is_slouching = False
+
+    if landmarks:
+        def pt(idx):
+            p = landmarks[idx]
+            return p.x * w, p.y * h, getattr(p, "visibility", 1.0)
+
+        l_sh_x, l_sh_y, l_sh_v = pt(LM_LEFT_SHOULDER)
+        r_sh_x, r_sh_y, r_sh_v = pt(LM_RIGHT_SHOULDER)
+        l_ear_x, l_ear_y, l_ear_v = pt(LM_LEFT_EAR)
+        r_ear_x, r_ear_y, r_ear_v = pt(LM_RIGHT_EAR)
+        l_hip_x, l_hip_y, l_hip_v = pt(LM_LEFT_HIP)
+        r_hip_x, r_hip_y, r_hip_v = pt(LM_RIGHT_HIP)
+
+        # Use whichever side (left/right) MediaPipe is more confident about
+        # -- people rarely sit perfectly square to the camera.
+        if (l_sh_v + l_ear_v + l_hip_v) >= (r_sh_v + r_ear_v + r_hip_v):
+            sh_x, sh_y, ear_x, ear_y, hip_x, hip_y = (
+                l_sh_x, l_sh_y, l_ear_x, l_ear_y, l_hip_x, l_hip_y)
+        else:
+            sh_x, sh_y, ear_x, ear_y, hip_x, hip_y = (
+                r_sh_x, r_sh_y, r_ear_x, r_ear_y, r_hip_x, r_hip_y)
+
+        neck_angle = find_angle(sh_x, sh_y, ear_x, ear_y)
+        torso_angle = find_angle(hip_x, hip_y, sh_x, sh_y)
+
+        is_slouching = (neck_angle > NECK_ANGLE_THRESHOLD or
+                         torso_angle > TORSO_ANGLE_THRESHOLD)
+
+        color = BAD_COLOR_BGR if is_slouching else GOOD_COLOR_BGR
+        _draw_skeleton(frame, landmarks, w, h, color)
+
+        label = "BAD POSTURE" if is_slouching else "GOOD POSTURE"
+        cv2.putText(frame, f"{label}  (neck {neck_angle} deg / torso {torso_angle} deg)",
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    else:
+        cv2.putText(frame, "No person detected", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+    return frame, is_slouching
+
+def draw_phone_boxes(frame):
+    """Draws a box around the last detected phone, if any."""
+    if phone_detected and phone_box:
+        x1, y1, x2, y2 = phone_box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), BAD_COLOR_BGR, 2)
+        cv2.putText(frame, "PHONE", (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, BAD_COLOR_BGR, 2)
+
+
+# =========================================================
+# MAIN SPINE APPLICATION CLASS
+# =========================================================
+
+class SpineApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("S.P.I.N.E.")
+        self.root.geometry("1000x650")
+        self.root.configure(bg=DARK_BG)
+
+        self.running = True
+        self.bad_posture_start = None
+        self.sequence_started = False
+        self.sequence_state = "WAITING"
+        self.MEME_INTERVAL = 3.0  # Time in seconds before triggering roast
+        self.meme_queue = []      # shuffled, non-repeating order of memes
+        self.last_meme = None     # last meme shown, to avoid back-to-back repeats
+
+        # File paths set inside 'Desktop/ann'
+        self.WAKEUP_AUDIO = os.path.join(BASE_DIR, "wakeup.mp3")
+
+        # Define Meme List with paths pointing directly inside 'ann'
+        self.memes = [
+            {
+                "name": "Jagathy Roast",
+                "image": os.path.join(BASE_DIR, "jagathy.jpeg"),
+                "audio": os.path.join(BASE_DIR, "jagathy.mp3"),
+            },
+            {
+                "name": "Salim Kumar Roast",
+                "image": os.path.join(BASE_DIR, "salim.jpeg"),
+                "audio": os.path.join(BASE_DIR, "salim.mp3"),
+            },
+            {
+                "name": "Sreenivasan Roast",
+                "image": os.path.join(BASE_DIR, "sreeni.jpeg"),
+                "audio": os.path.join(BASE_DIR, "sreeni.mp3"),
+            }
+        ]
+
+        # Check and debug file existence on startup
+        self.verify_files()
+
+        # Build GUI Layout
+        self.setup_ui()
+
+        # Protocol hook for window close button
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        # Start Video Frame Loop
+        self.update_frame()
+
+    def verify_files(self):
+        """Prints status of media assets to terminal for quick debugging."""
+        print(f"\n[SYSTEM CHECK] Inspecting asset directory: {BASE_DIR}")
+        print(f" - Wakeup Sound Found: {os.path.exists(self.WAKEUP_AUDIO)}")
+        for idx, meme in enumerate(self.memes):
+            img_ok = os.path.exists(meme["image"])
+            aud_ok = os.path.exists(meme["audio"])
+            print(f" - Meme [{idx}] '{meme['name']}' -> Image: {img_ok} | Audio: {aud_ok}")
+        print("=========================================================\n")
+
+    def setup_ui(self):
+        """Initializes Tkinter UI widgets."""
+        # Top Header
+        self.title_label = tk.Label(self.root, text="S.P.I.N.E.", font=("Arial", 22, "bold"), fg="white", bg=DARK_BG)
+        self.title_label.pack(pady=5)
+
+        self.subtitle_label = tk.Label(self.root, text="Sarcastic Posture Inspection & Nagging Engine", font=("Arial", 10), fg="gray", bg=DARK_BG)
+        self.subtitle_label.pack(pady=(0, 10))
+
+        # Main Layout Frame
+        self.main_container = tk.Frame(self.root, bg=DARK_BG)
+        # FIX: pack() takes padx/pady, not px/py. The old kwargs raised a
+        # TclError ("unknown option -px") which silently crashed the whole
+        # app before the window ever appeared.
+        self.main_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Left Column: Meme View
+        self.meme_frame = tk.Frame(self.main_container, bg="#11111d", width=250)
+        self.meme_frame.pack(side="left", fill="both", expand=False, padx=5)
+        # Keep this column at a fixed width regardless of its children's
+        # requested size (otherwise the frame would shrink/grow with content).
+        self.meme_frame.pack_propagate(False)
+
+        self.meme_header = tk.Label(self.meme_frame, text="MEME ROAST", font=("Arial", 12, "bold"), fg="white", bg="#11111d")
+        self.meme_header.pack(pady=10)
+
+        self.meme_status = tk.Label(self.meme_frame, text="NO MEME FOUND", font=("Arial", 10, "bold"), fg=RED, bg="#11111d")
+        self.meme_status.pack(pady=5)
+
+        # NOTE: no width/height here. Tkinter treats Label width/height as
+        # CHARACTER units for text but PIXEL units once an image is shown,
+        # so hardcoding e.g. width=25, height=15 would shrink the label to
+        # 25x15 pixels the moment a meme image loads, clipping it badly.
+        self.meme_display = tk.Label(self.meme_frame, text="No roast yet", fg="gray", bg="#11111d")
+        self.meme_display.pack(pady=10, fill="both", expand=True)
+
+        self.audio_label = tk.Label(self.meme_frame, text="Audio: Idle", font=("Arial", 9), fg="gray", bg="#11111d")
+        self.audio_label.pack(pady=5)
+
+        # Center Column: Camera Display
+        self.camera_frame = tk.Frame(self.main_container, bg="black")
+        self.camera_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.camera_label = tk.Label(self.camera_frame, bg="black")
+        self.camera_label.pack(fill="both", expand=True)
+
+        # Right Column: Status Panel
+        self.status_frame = tk.Frame(self.main_container, bg="#11111d", width=220)
+        self.status_frame.pack(side="right", fill="both", expand=False, padx=5)
+
+        self.behaviour_label = tk.Label(self.status_frame, text="BEHAVIOUR", font=("Arial", 12, "bold"), fg="white", bg="#11111d")
+        self.behaviour_label.pack(pady=10)
+
+        self.alert_label = tk.Label(self.status_frame, text="GOOD POSTURE", font=("Arial", 14, "bold"), fg=GREEN, bg="#11111d")
+        self.alert_label.pack(pady=10)
+
+        self.phone_status_label = tk.Label(self.status_frame, text="", font=("Arial", 12, "bold"), fg=RED, bg="#11111d")
+        self.phone_status_label.pack(pady=5)
+
+        self.timer_text = tk.Label(self.status_frame, text="Timer: 0.0 sec", font=("Arial", 10), fg="white", bg="#11111d")
+        self.timer_text.pack(pady=5)
+
+        self.sequence_text = tk.Label(self.status_frame, text="Sequence: Waiting", font=("Arial", 10), fg=YELLOW, bg="#11111d")
+        self.sequence_text.pack(pady=5)
+
+    def choose_meme(self):
+        """Picks the next meme from a shuffled, non-repeating queue.
+        Once every meme has been shown, the queue reshuffles -- and we
+        make sure the reshuffle doesn't put the just-shown meme right
+        back at the front, so two of the same never play back to back."""
+        valid_memes = [m for m in self.memes if os.path.exists(m["image"])]
+        if not valid_memes:
+            return None
+
+        if len(valid_memes) == 1:
+            self.last_meme = valid_memes[0]
+            return valid_memes[0]
+
+        if not self.meme_queue:
+            new_queue = valid_memes.copy()
+            random.shuffle(new_queue)
+            if self.last_meme and new_queue[0]["name"] == self.last_meme["name"]:
+                new_queue.append(new_queue.pop(0))
+            self.meme_queue = new_queue
+
+        next_meme = self.meme_queue.pop(0)
+        self.last_meme = next_meme
+        return next_meme
+
+    def show_meme(self, item):
+        """Renders the meme image onto the Tkinter Label widget, sized to
+        fit whatever space the sidebar panel currently has."""
+        if not item or not os.path.exists(item["image"]):
+            self.meme_status.config(text="NO MEME FOUND", fg=RED)
+            return
+
+        try:
+            img = Image.open(item["image"])
+
+            # Fit to the label's actual current size (same approach used
+            # for the camera feed) so the image isn't clipped or tiny.
+            self.meme_display.update_idletasks()
+            area_w = max(200, self.meme_display.winfo_width())
+            area_h = max(240, self.meme_display.winfo_height())
+            img.thumbnail((area_w - 10, area_h - 10), Image.Resampling.LANCZOS)
+
+            self.meme_photo = ImageTk.PhotoImage(img)
+
+            self.meme_display.config(image=self.meme_photo, text="")
+            self.meme_display.image = self.meme_photo
+            self.meme_status.config(text=item["name"], fg=GREEN)
+        except Exception as e:
+            print(f"[IMAGE ERROR] Could not load image: {e}")
+            self.meme_status.config(text="IMAGE ERROR", fg=RED)
+
+    def clear_meme(self):
+        """Clears meme panel display upon recovery."""
+        self.meme_display.config(image="", text="No roast yet")
+        self.meme_display.image = None
+        self.meme_status.config(text="NO MEME FOUND", fg=RED)
+        self.audio_label.config(text="Audio: Idle", fg="gray")
+
+    def set_bad_ui(self, is_slouching, phone_flag):
+        """Updates UI status labels for bad behaviour, naming the actual
+        cause(s) so the sidebar reflects what triggered it."""
+        self.alert_label.config(text="ATTENTION\nBAD POSTURE" if is_slouching else "ATTENTION", fg=RED)
+        self.phone_status_label.config(text="\U0001F4F1 PHONE DETECTED" if phone_flag else "")
+
+    def set_good_ui(self):
+        """Resets UI labels when good behaviour is detected."""
+        self.alert_label.config(text="GOOD POSTURE", fg=GREEN)
+        self.phone_status_label.config(text="")
+        self.timer_text.config(text="Timer: 0.0 sec", fg="white")
+        self.sequence_text.config(text="Sequence: Idle", fg="gray")
+
+    def start_wakeup(self):
+        """Starts alarm sequence."""
+        self.sequence_state = "WAKEUP"
+        if not os.path.isfile(self.WAKEUP_AUDIO):
+            print("[WAKEUP] wakeup.mp3 missing. Advancing directly to meme.")
+            self.start_meme()
+            return
+
+        self.sequence_text.config(text="Sequence: Wakeup Sound", fg=YELLOW)
+        self.audio_label.config(text="Audio: Alert Sound", fg=YELLOW)
+        play_audio(self.WAKEUP_AUDIO)
+
+    def start_meme(self):
+        """Selects and triggers meme roast."""
+        self.sequence_state = "MEME"
+        item = self.choose_meme()
+
+        if item is None:
+            self.sequence_text.config(text="Sequence: No Meme Found", fg=RED)
+            return
+
+        self.sequence_text.config(text=f"Sequence: {item['name']}", fg=RED)
+        self.show_meme(item)
+
+        if os.path.isfile(item["audio"]):
+            self.audio_label.config(text=f"Audio: {item['name']}", fg=RED)
+            play_audio(item["audio"])
+        else:
+            self.audio_label.config(text="Audio File Missing", fg=RED)
+
+    def handle_sequence(self):
+        """Manages progression of nag audio stages."""
+        if self.sequence_state == "WAKEUP" and not audio_is_playing():
+            self.start_meme()
+        elif self.sequence_state == "MEME" and not audio_is_playing():
+            self.start_meme()
+
+    def update_frame(self):
+        """Main loop managing webcam updates and detection logic."""
+        global frame_counter, last_yolo_frame, phone_detected
+
+        if not self.running:
+            return
+
+        ret, frame = cap.read()
+        if not ret:
+            self.root.after(30, self.update_frame)
+            return
+
+        frame_counter += 1
+        frame = cv2.flip(frame, 1)
+
+        if frame_counter - last_yolo_frame >= 5:
+            last_yolo_frame = frame_counter
+            detect_phone(frame)
+
+        frame, is_slouching = detect_pose(frame)
+        draw_phone_boxes(frame)
+        is_bad_behavior = is_slouching or phone_detected
+        current_time = time.time()
+
+        if is_bad_behavior:
+            if self.bad_posture_start is None:
+                self.bad_posture_start = current_time
+
+            elapsed = current_time - self.bad_posture_start
+            self.set_bad_ui(is_slouching, phone_detected)
+            self.timer_text.config(text=f"Timer: {elapsed:.1f} sec", fg=RED)
+
+            if elapsed >= self.MEME_INTERVAL and not self.sequence_started:
+                self.sequence_started = True
+                print("\n3 SECONDS COMPLETED")
+                print("STARTING ROAST SEQUENCE")
+                self.start_wakeup()
+            elif self.sequence_started:
+                # FIX: only advance the sequence on frames *after* the one
+                # that triggered it. Previously this ran unconditionally,
+                # even on the same frame as start_wakeup()/start_meme(),
+                # which could immediately skip to the next meme before the
+                # current one had a chance to display/play.
+                self.handle_sequence()
+
+            if not self.sequence_started:
+                remaining = max(0, self.MEME_INTERVAL - elapsed)
+                self.meme_status.config(text=f"Roast starts in {remaining:.1f} sec", fg=YELLOW)
+                self.sequence_text.config(text="Sequence: Waiting", fg=YELLOW)
+
+        else:
+            if self.bad_posture_start is not None:
+                print("Good behaviour restored.")
+
+            self.bad_posture_start = None
+            self.sequence_started = False
+            self.sequence_state = "WAITING"
+
+            stop_audio()
+            self.clear_meme()
+            self.set_good_ui()
+
+        # Display camera stream
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_frame = Image.fromarray(frame_rgb)
+
+        area_w = max(400, self.camera_label.winfo_width())
+        area_h = max(300, self.camera_label.winfo_height())
+        pil_frame.thumbnail((area_w - 10, area_h - 10), Image.Resampling.LANCZOS)
+
+        self.camera_photo = ImageTk.PhotoImage(pil_frame)
+        self.camera_label.config(image=self.camera_photo, text="")
+        self.camera_label.image = self.camera_photo
+
+        self.root.after(20, self.update_frame)
+
+    def close(self):
+        """Safely cleans up app resources upon exit."""
+        if not self.running:
+            return
+
+        self.running = False
+        print("\nClosing S.P.I.N.E...")
+
+        try:
+            stop_audio()
+        except Exception:
+            pass
+
+        try:
+            if 'cap' in globals() and cap.isOpened():
+                cap.release()
+        except Exception:
+            pass
+
+        try:
+            if 'pose_detector' in globals() and pose_detector is not None:
+                pose_detector.close()
+            if 'pose_landmarker' in globals() and pose_landmarker is not None:
+                pose_landmarker.close()
+        except Exception:
+            pass
+
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+# =========================================================
+# START PROGRAM DRIVER
+# =========================================================
+
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = SpineApp(root)
+        root.mainloop()
+    except Exception as e:
+        print("\nPROGRAM ERROR:", e)
+        try:
+            if 'cap' in globals() and cap.isOpened():
+                cap.release()
+            pygame.mixer.quit()
+        except Exception:
+            pass
